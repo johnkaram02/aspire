@@ -4,6 +4,8 @@
 #pragma warning disable ASPIREPIPELINES001 // Existing registrations remove the framework's provisioning annotations.
 #pragma warning disable ASPIREAZURE003 // Tenant-scoped resource annotations are experimental.
 
+using System.IO.Hashing;
+using System.Text;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Azure.EntraId.Provisioning;
 using Aspire.Hosting.Pipelines;
@@ -103,19 +105,21 @@ public class EntraIdApplicationResource : AzureProvisioningResource
     /// </summary>
     /// <remarks>
     /// The expression keeps parameter and output references unresolved so values supplied at deployment time or by
-    /// provisioning flow through to the consuming resource.
+    /// provisioning flow through to the consuming resource. A registration with no explicit or provisioned application ID URI
+    /// uses the default <c>api://{clientId}</c>.
     /// </remarks>
     internal ReferenceExpression CreateApplicationIdUriExpression()
     {
-        if (ApplicationIdUriParameter is { } uriParameter)
+        // The provisioned output only exists when the deployment sets an application ID URI.
+        if (ApplicationIdUri is not null || (!IsExistingApplication && HasApplicationIdUri))
         {
-            return ReferenceExpression.Create($"{uriParameter}");
-        }
-
-        if (!string.IsNullOrEmpty(ApplicationIdUri))
-        {
-            // Scopes are joined with a "/" separator, so a trailing slash in the configured URI would double it.
-            return ReferenceExpression.Create($"{ApplicationIdUri.TrimEnd('/')}");
+            return ApplicationIdUriValue switch
+            {
+                // Scopes are joined with a "/" separator, so a trailing slash in the configured URI would double it.
+                string uri => ReferenceExpression.Create($"{uri.TrimEnd('/')}"),
+                BicepOutputReference output => ReferenceExpression.Create($"{output}"),
+                _ => throw new InvalidOperationException($"The application ID URI of '{Name}' is not configured.")
+            };
         }
 
         return ClientIdValue switch
@@ -284,7 +288,10 @@ public class EntraIdApplicationResource : AzureProvisioningResource
         {
             application.Owners = CreateOwnerList(infrastructure, resource.ApplicationOwners, "applicationOwner");
         }
+        EntraIdApiProvisioning.ConfigureRequiredResourceAccess(resource, infrastructure, application);
         infrastructure.Add(application);
+
+        var applicationIdUri = EntraIdApiProvisioning.ConfigureExposedApi(resource, infrastructure, application, registrationName);
 
         var servicePrincipal = new MicrosoftGraphServicePrincipal("servicePrincipal")
         {
@@ -297,12 +304,18 @@ public class EntraIdApplicationResource : AzureProvisioningResource
         }
         infrastructure.Add(servicePrincipal);
 
+        EntraIdApiProvisioning.ConfigureGrants(resource, infrastructure, servicePrincipal);
+
         infrastructure.Add(new ProvisioningOutput(EntraIdBicepConstants.ClientIdOutputName, typeof(string)) { Value = application.AppId.ToBicepExpression() });
         // Compile the scope-function property directly; ToBicepExpression would reference an undeclared "tenant" resource.
         infrastructure.Add(new ProvisioningOutput(EntraIdBicepConstants.TenantIdOutputName, typeof(string)) { Value = BicepFunction.GetTenant().TenantId.Compile() });
         infrastructure.Add(new ProvisioningOutput(EntraIdBicepConstants.ObjectIdOutputName, typeof(string)) { Value = application.Id.ToBicepExpression() });
         infrastructure.Add(new ProvisioningOutput(EntraIdBicepConstants.ServicePrincipalIdOutputName, typeof(string)) { Value = servicePrincipal.Id.ToBicepExpression() });
         infrastructure.Add(new ProvisioningOutput(EntraIdBicepConstants.UniqueNameOutputName, typeof(string)) { Value = application.UniqueName.ToBicepExpression() });
+        if (applicationIdUri is not null)
+        {
+            infrastructure.Add(new ProvisioningOutput(EntraIdBicepConstants.ApplicationIdUriOutputName, typeof(string)) { Value = applicationIdUri });
+        }
     }
 
     // ── Core identity ──────────────────────────────────────────────────────
@@ -353,38 +366,6 @@ public class EntraIdApplicationResource : AzureProvisioningResource
     /// <see cref="ClientIdParameter"/> takes precedence.
     /// </remarks>
     public string? ClientId { get; set; }
-
-    /// <summary>
-    /// Gets or sets the parameter resource for the application ID URI that identifies this registration as a web API.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// The application ID URI is the prefix of the scopes that the API exposes, such as
-    /// <c>api://00001111-aaaa-2222-bbbb-3333cccc4444/access_as_user</c>. It is shown as "Application ID URI"
-    /// on the app registration's <b>Expose an API</b> page.
-    /// </para>
-    /// <para>
-    /// Aspire only reads this value to qualify scopes for <c>WithDownstreamApi</c>. It does not modify the registration.
-    /// When both <see cref="ApplicationIdUriParameter"/> and <see cref="ApplicationIdUri"/> are set,
-    /// <see cref="ApplicationIdUriParameter"/> takes precedence.
-    /// </para>
-    /// </remarks>
-    public ParameterResource? ApplicationIdUriParameter { get; set; }
-
-    /// <summary>
-    /// Gets or sets a fixed application ID URI that identifies this registration as a web API.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// When neither this property nor <see cref="ApplicationIdUriParameter"/> is set, the default
-    /// <c>api://{clientId}</c> is used.
-    /// Set it for registrations that use a different URI, such as <c>https://contoso.onmicrosoft.com/my-api</c>.
-    /// </para>
-    /// <para>
-    /// Aspire only reads this value to qualify scopes for <c>WithDownstreamApi</c>. It does not modify the registration.
-    /// </para>
-    /// </remarks>
-    public string? ApplicationIdUri { get; set; }
 
     /// <summary>
     /// Gets or sets which accounts can sign in to the application.
@@ -514,6 +495,98 @@ public class EntraIdApplicationResource : AzureProvisioningResource
     /// allowing client credentials flow callers to be authorized by an Access Control List.
     /// </remarks>
     public bool AllowWebApiToBeAuthorizedByACL { get; set; }
+
+    // ── Exposed API ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Gets the application ID URI that identifies this registration as an API, when one was set explicitly.
+    /// </summary>
+    /// <remarks>
+    /// This is <see langword="null"/> when the registration uses the default <c>api://{clientId}</c> URI, which is known only after
+    /// the registration is created. Use <see cref="GetScopeUri(string)"/> to refer to a scope's full URI in either case.
+    /// </remarks>
+    public string? ApplicationIdUri { get; internal set; }
+
+    internal bool UsesDefaultApplicationIdUri { get; set; }
+
+    /// <summary>
+    /// Gets the delegated permission scopes that this registration exposes.
+    /// </summary>
+    public IReadOnlyList<EntraIdScope> Scopes => _scopes;
+
+    private readonly List<EntraIdScope> _scopes = [];
+
+    internal List<EntraIdPreAuthorizedClient> PreAuthorizedClients { get; } = [];
+
+    internal List<EntraIdApiAccess> ApiAccess { get; } = [];
+
+    internal bool HasApplicationIdUri => ApplicationIdUri is not null || UsesDefaultApplicationIdUri || _scopes.Count > 0;
+
+    /// <summary>
+    /// Gets the application ID URI produced when the registration is provisioned with an application ID URI.
+    /// </summary>
+    public BicepOutputReference ApplicationIdUriOutputReference => new(EntraIdBicepConstants.ApplicationIdUriOutputName, this);
+
+    internal BicepOutputReference ServicePrincipalIdOutputReference => new(EntraIdBicepConstants.ServicePrincipalIdOutputName, this);
+
+    internal object? ApplicationIdUriValue => ApplicationIdUri is { } uri
+        ? uri
+        : IsExistingApplication
+            ? null
+            : ApplicationIdUriOutputReference;
+
+    /// <summary>
+    /// Gets an expression for the full URI of one of this registration's scopes, such as <c>api://{clientId}/access_as_user</c>.
+    /// </summary>
+    /// <param name="scopeName">The name of a scope added with <c>WithScope</c>.</param>
+    /// <returns>An expression that resolves when the registration's application ID URI is known.</returns>
+    /// <exception cref="ArgumentException">The registration does not expose a scope with that name.</exception>
+    /// <exception cref="InvalidOperationException">The registration is an existing registration without an application ID URI.</exception>
+    /// <remarks>
+    /// Clients request the full URI as the token scope, for example in Microsoft.Identity.Web's <c>DownstreamApis</c> configuration.
+    /// </remarks>
+    public ReferenceExpression GetScopeUri(string scopeName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(scopeName);
+
+        if (!_scopes.Any(s => string.Equals(s.Name, scopeName, StringComparison.Ordinal)))
+        {
+            throw new ArgumentException($"'{Name}' does not expose a scope named '{scopeName}'. Add it with WithScope first.", nameof(scopeName));
+        }
+
+        return ApplicationIdUriValue switch
+        {
+            string uri => ReferenceExpression.Create($"{uri}/{scopeName}"),
+            BicepOutputReference output => ReferenceExpression.Create($"{output}/{scopeName}"),
+            _ => throw new InvalidOperationException($"The application ID URI of '{Name}' is not configured. Call WithApplicationIdUri with the registration's URI.")
+        };
+    }
+
+    internal void AddScope(EntraIdScope scope) => _scopes.Add(scope);
+
+    // Scope IDs must not change between deployments, and Graph rejects a request that drops an enabled scope, so a
+    // random ID is not an option. Deriving the ID from the registration and scope names also gives every tenant the same IDs.
+    internal Guid GetScopeId(EntraIdScope scope)
+    {
+        if (scope.Id is { } id)
+        {
+            return id;
+        }
+
+        if (IsExistingApplication)
+        {
+            throw new InvalidOperationException(
+                $"The ID of scope '{scope.Name}' of the existing registration '{Name}' is unknown. Set EntraIdScope.Id to the ID that the registration defines.");
+        }
+
+        Span<byte> hash = stackalloc byte[16];
+        XxHash128.Hash(Encoding.UTF8.GetBytes($"{Name}/{scope.Name}"), hash);
+
+        // Mark the GUID as RFC 9562 version 8 (custom) with the standard variant.
+        hash[6] = (byte)((hash[6] & 0x0F) | 0x80);
+        hash[8] = (byte)((hash[8] & 0x3F) | 0x80);
+        return new Guid(hash, bigEndian: true);
+    }
 
     // ── Query parameters ───────────────────────────────────────────────────
 
